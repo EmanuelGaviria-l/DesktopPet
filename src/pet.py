@@ -1,31 +1,54 @@
-from PyQt6.QtCore import QTimer
+import time
+from PyQt6.QtCore import QTimer, QObject, pyqtSignal
 from src.ui.pet_window import PetWindow
+from src import cemetery
 
 
-class Pet:
+class Pet(QObject):
     """
-    El "cerebro" del Tamagotchi: controla hambre, energia y felicidad,
-    decide el estado actual, y reacciona a las opciones que el usuario
-    elige en el menu de la mascota (Alimentar/Jugar/Asignar tarea).
+    El "cerebro" del Tamagotchi: controla hambre, energia y felicidad.
+    Si el hambre llega a 0, entra en un periodo de gracia ("starving")
+    de STARVATION_GRACE_MS. Si se alimenta a tiempo, se salva. Si no,
+    muere de forma permanente cuando se acaba ese plazo.
     """
 
-    DECAY_PER_TICK = {"hunger": 2, "energy": 1, "happiness": 1}
-    TICK_MS = 30_000  # cada cuanto bajan las stats
+    died = pyqtSignal(str, float)
+    stats_changed = pyqtSignal(dict)  # avisa cada vez que hunger/energy/happiness cambian
 
-    def __init__(self):
+    # --- Calculado para que, sin cuidar la mascota, el hambre llegue
+    # a 0 en aproximadamente 7 horas (420 minutos, tick cada 1 min).
+    # Energia y felicidad bajan mas lento, ya que no son letales.
+    DECAY_PER_TICK = {"hunger": 0.24, "energy": 0.12, "happiness": 0.12}
+    TICK_MS = 60_000  # un tick cada minuto
+
+    STARVATION_GRACE_MS = 20 * 60 * 1000  # 20 minutos de gracia en 0 antes de morir
+    DEATH_ANIMATION_DELAY_MS = 2500  # cuanto se ve la animacion "dead" antes del aviso final
+
+    def __init__(self, name: str, sprite_path: str):
+        super().__init__()
+        self.name = name
+        self._birth_time = time.time()
+
         # --- Ventana y animaciones ---
         self.window = PetWindow()
-        self.window.load_state_frames("idle", ["assets/cat_test.png"])
-        self.window.load_state_frames("hungry", ["assets/cat_test.png"])
-        self.window.load_state_frames("bored", ["assets/cat_test.png"])
-        self.window.load_state_frames("happy", ["assets/cat_test.png"])
-        self.window.load_state_frames("dead", ["assets/cat_test.png"])  # TODO: sprite de "muerto" real
+        self.window.load_state_frames("idle", [sprite_path])
+        self.window.load_state_frames("hungry", [sprite_path])
+        self.window.load_state_frames("bored", [sprite_path])
+        self.window.load_state_frames("happy", [sprite_path])
+        self.window.load_state_frames("starving", [sprite_path])  # TODO: sprite distinto, mas urgente
+        self.window.load_state_frames("dead", [sprite_path])       # TODO: sprite de "muerto" real
         self.window.play_state("idle")
 
         # --- Stats del Tamagotchi ---
         self.stats = {"hunger": 100, "energy": 100, "happiness": 100}
         self.state = "idle"
         self._alive = True
+
+        # --- Periodo de gracia por inanicion ---
+        self._starving = False
+        self._starvation_timer = QTimer()
+        self._starvation_timer.setSingleShot(True)
+        self._starvation_timer.timeout.connect(self._on_starvation_timeout)
 
         # --- El menu de la ventana avisa aqui que opcion eligio el usuario ---
         self.window.feed_requested.connect(lambda: self.feed())
@@ -38,24 +61,21 @@ class Pet:
         self._timer.start(self.TICK_MS)
 
     # ============================================================
-    # API PUBLICA — usada por el menu, y luego por ai_brain.py / skills
+    # API PUBLICA
     # ============================================================
 
     def feed(self, amount: int = 20):
-        """Le da de comer. No hace nada si ya murio."""
         if not self._alive:
             return
         self._adjust("hunger", amount)
 
     def play(self, amount: int = 15):
-        """Juega con la mascota (sube felicidad, gasta energia)."""
         if not self._alive:
             return
         self._adjust("happiness", amount)
         self._adjust("energy", -5)
 
     def rest(self, amount: int = 30):
-        """La deja descansar (sube energia)."""
         if not self._alive:
             return
         self._adjust("energy", amount)
@@ -64,19 +84,7 @@ class Pet:
         return self.state
 
     def is_alive(self) -> bool:
-        """
-        Punto de coordinacion con el resto del proyecto (ej: Jose deberia
-        chequear esto antes de mostrar una burbuja de recordatorio).
-        """
         return self._alive
-
-    def revive(self):
-        """Reinicia la mascota desde cero (para un futuro boton de 'jugar de nuevo')."""
-        self.stats = {"hunger": 100, "energy": 100, "happiness": 100}
-        self._alive = True
-        self.state = "idle"
-        self.window.play_state("idle")
-        self._timer.start(self.TICK_MS)
 
     # ============================================================
     # INTERNOS
@@ -89,25 +97,30 @@ class Pet:
 
     def _adjust(self, stat: str, amount: float):
         self.stats[stat] = max(0, min(100, self.stats[stat] + amount))
+        self.stats_changed.emit(self.stats)
         self._update_state()
 
     def _update_state(self):
-        """
-        Decide el estado segun las stats. Solo el HAMBRE en 0 causa la
-        muerte (felicidad/energia bajas solo cambian el animo, no matan).
-        """
         if not self._alive:
             return
 
         prev_state = self.state
 
-        # --- Muerte: unicamente por hambre ---
+        # --- Hambre en 0: entra (o se mantiene) en periodo de gracia ---
         if self.stats["hunger"] <= 0:
-            self.state = "dead"
-            self._alive = False
-            self._timer.stop()
-            self.window.play_state("dead")
+            if not self._starving:
+                # Primera vez que llega a 0: arrancamos el reloj de gracia
+                self._starving = True
+                self._starvation_timer.start(self.STARVATION_GRACE_MS)
+            self.state = "starving"
+            if self.state != prev_state:
+                self.window.play_state("starving")
             return
+
+        # --- Si se alimento a tiempo durante el periodo de gracia, se salva ---
+        if self._starving:
+            self._starving = False
+            self._starvation_timer.stop()
 
         # --- Estados normales ---
         if self.stats["hunger"] <= 30:
@@ -122,10 +135,23 @@ class Pet:
         if self.state != prev_state:
             self.window.play_state(self.state)
 
+    def _on_starvation_timeout(self):
+        """Se acabo el periodo de gracia sin comer: la mascota muere, de forma permanente."""
+        if not self._alive or self.stats["hunger"] > 0:
+            return  # se salvo justo a tiempo, no hacer nada
+
+        self.state = "dead"
+        self._alive = False
+        self._timer.stop()
+        self.window.play_state("dead")
+
+        QTimer.singleShot(self.DEATH_ANIMATION_DELAY_MS, self._finalize_death)
+
+    def _finalize_death(self):
+        """Se ejecuta despues de ver la animacion 'dead': guarda el registro y avisa a main.py."""
+        seconds_alive = time.time() - self._birth_time
+        cemetery.save_death_record(self.name, seconds_alive)
+        self.died.emit(self.name, seconds_alive)
+
     def _on_assign_task_requested(self):
-        """
-        Placeholder por ahora: aqui es donde en el futuro se abrira
-        la interfaz para escribirle una tarea/recordatorio a la mascota,
-        una vez que construyamos esa parte del asistente.
-        """
         print("[pet] Asignar tarea seleccionado — funcionalidad pendiente")
