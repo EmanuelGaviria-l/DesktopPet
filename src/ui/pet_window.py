@@ -1,30 +1,31 @@
 import sys
 import random
 from typing import Optional
-from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QMenu, QProgressBar
-)
+from PyQt6.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout, QMenu
 from PyQt6.QtCore import Qt, QPoint, QTimer, pyqtSignal
 from PyQt6.QtGui import QPixmap, QMouseEvent, QTransform
 
 
 class PetWindow(QWidget):
-    # --- Senales que pet.py escucha para reaccionar a lo que pasa en la ventana ---
     dragged = pyqtSignal(QPoint)
     feed_requested = pyqtSignal()
     play_requested = pyqtSignal()
     assign_task_requested = pyqtSignal()
     quit_requested = pyqtSignal()
 
-    # --- Configuracion de movimiento y animacion ---
+    # Avisan cuando se abre/cierra el menu, con la posicion y tamano
+    # de la ventana del gato, para que main.py pueda mostrar/ocultar
+    # y posicionar la ventana de stats justo arriba de el.
+    menu_opened = pyqtSignal(int, int, int, int)  # x, y, ancho, alto
+    menu_closed = pyqtSignal()
+
     WALK_SPEED = 3
     MIN_IDLE_MS = 1500
     MAX_IDLE_MS = 4000
     SCREEN_MARGIN = 40
     ANIMATION_MS = 200
     SPRITE_SCALE = 4
-    CLICK_DRAG_THRESHOLD = 6  # pixeles: menos que esto cuenta como "click", no arrastre
-    STATS_BAR_WIDTH = 90
+    CLICK_DRAG_THRESHOLD = 6
 
     def __init__(self):
         super().__init__()
@@ -32,34 +33,11 @@ class PetWindow(QWidget):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
-        # ============================================================
-        # ESTRUCTURA VISUAL: barras de stats (arriba) + sprite (abajo)
-        # Las barras empiezan ocultas — solo se muestran con un click.
-        # ============================================================
-        outer_layout = QVBoxLayout(self)
-        outer_layout.setContentsMargins(0, 0, 0, 0)
-        outer_layout.setSpacing(2)
+        self.label = QLabel(self)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.label)
 
-        self.stats_container = QWidget()
-        self.stats_container.setStyleSheet("""
-            background-color: rgba(30, 30, 30, 170);
-            border-radius: 6px;
-        """)
-        stats_layout = QVBoxLayout(self.stats_container)
-        stats_layout.setContentsMargins(6, 4, 6, 4)
-        stats_layout.setSpacing(2)
-
-        self.hunger_bar = self._build_bar_row("🍖", stats_layout)
-        self.energy_bar = self._build_bar_row("⚡", stats_layout)
-        self.happiness_bar = self._build_bar_row("💛", stats_layout)
-
-        self.stats_container.hide()  # ocultas por defecto
-        outer_layout.addWidget(self.stats_container, alignment=Qt.AlignmentFlag.AlignHCenter)
-
-        self.label = QLabel()
-        outer_layout.addWidget(self.label, alignment=Qt.AlignmentFlag.AlignHCenter)
-
-        # --- Sistema de animacion ---
         self._animations: dict[str, list[QPixmap]] = {}
         self._current_state: Optional[str] = None
         self._frame_index = 0
@@ -71,7 +49,6 @@ class PetWindow(QWidget):
 
         self.resize(128, 128)
 
-        # --- Estado del mouse ---
         self._drag_offset = QPoint()
         self._press_global_pos = QPoint()
         self._dragging = False
@@ -80,7 +57,6 @@ class PetWindow(QWidget):
         screen = QApplication.primaryScreen().geometry()
         self.move(screen.width() - 200, screen.height() - 200)
 
-        # --- Movimiento autonomo ---
         self._walking = False
         self._target_x = float(self.x())
         self._target_y = float(self.y())
@@ -99,39 +75,6 @@ class PetWindow(QWidget):
 
     def bring_to_front(self):
         self.raise_()
-
-    # ============================================================
-    # BARRAS DE STATS (parte visual, arriba del sprite)
-    # ============================================================
-
-    def _build_bar_row(self, emoji: str, parent_layout: QVBoxLayout) -> QProgressBar:
-        """Crea una fila con un emoji y su barra de progreso correspondiente."""
-        row = QHBoxLayout()
-
-        icon_label = QLabel(emoji)
-        icon_label.setStyleSheet("color: white;")
-        row.addWidget(icon_label)
-
-        bar = QProgressBar()
-        bar.setFixedWidth(self.STATS_BAR_WIDTH)
-        bar.setRange(0, 100)
-        bar.setValue(100)
-        bar.setTextVisible(False)
-        row.addWidget(bar)
-
-        parent_layout.addLayout(row)
-        return bar
-
-    def update_stats(self, stats: dict):
-        """Se llama cada vez que Pet avisa que hunger/energy/happiness cambiaron."""
-        self.hunger_bar.setValue(int(stats["hunger"]))
-        self.energy_bar.setValue(int(stats["energy"]))
-        self.happiness_bar.setValue(int(stats["happiness"]))
-
-    def _toggle_stats_visibility(self):
-        """Muestra u oculta las barras de stats, y ajusta el tamano de la ventana."""
-        self.stats_container.setVisible(not self.stats_container.isVisible())
-        self.adjustSize()
 
     # ============================================================
     # ANIMACION
@@ -182,8 +125,7 @@ class PetWindow(QWidget):
             frame = frame.transformed(QTransform().scale(-1, 1))
 
         self.label.setPixmap(frame)
-        self.label.setFixedSize(frame.size())
-        self.adjustSize()
+        self.resize(frame.size())
         self.setMask(frame.mask())
 
     # ============================================================
@@ -221,7 +163,7 @@ class PetWindow(QWidget):
         self.move(int(self._pos_x), int(self._pos_y))
 
     # ============================================================
-    # MOUSE: distinguir click rapido (menu + stats) de arrastre
+    # MOUSE
     # ============================================================
 
     def mousePressEvent(self, event: QMouseEvent):
@@ -256,9 +198,9 @@ class PetWindow(QWidget):
         if self._moved_past_threshold:
             self._pick_new_target()
         else:
-            # Click rapido: mostrar las stats Y el menu al mismo tiempo
-            self._toggle_stats_visibility()
+            self.menu_opened.emit(self.x(), self.y(), self.width(), self.height())
             self._show_options_menu(event.globalPosition().toPoint())
+            self.menu_closed.emit()
 
     def _show_options_menu(self, global_pos: QPoint):
         menu = QMenu(self)
@@ -269,9 +211,6 @@ class PetWindow(QWidget):
         quit_action = menu.addAction("❌ Cerrar DesktopPet")
 
         chosen = menu.exec(global_pos)
-
-        # Al cerrar el menu (elijas algo o no), ocultamos las stats de nuevo
-        self._toggle_stats_visibility()
 
         if chosen == feed_action:
             self.feed_requested.emit()
@@ -284,9 +223,6 @@ class PetWindow(QWidget):
             return
 
         self._pick_new_target()
-
-    def mouseDoubleClickEvent(self, event: QMouseEvent):
-        pass  # ya no se usa; el click rapido ahora abre menu + stats
 
 
 def run_standalone():
