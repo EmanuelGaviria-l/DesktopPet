@@ -1,4 +1,4 @@
-# Desktop Pet 🐾
+# Desktop Pet 
 
 A desktop companion built with Python and PyQt6. The application features an interactive virtual pet that lives on the user's desktop, manages its own needs over time, and responds to user interactions.
 
